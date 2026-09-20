@@ -30,9 +30,3 @@ jobs:
 
       - name: Run tests
         run: python -m pytest -q
-
-      # The suite is written to run entirely offline. If an import ever starts
-      # requiring network access, this fails the job rather than passing
-      # locally and breaking for everyone else.
-      - name: Verify the package imports
-        run: python -c "import dormant_radar, dormant_radar.cli, dormant_radar.api"

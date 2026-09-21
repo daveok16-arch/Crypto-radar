@@ -91,6 +91,59 @@ def test_scan_detects_and_persists(tmp_path):
         store.close()
 
 
+def test_no_new_blocks_is_a_no_op(tmp_path):
+    """A cursor at the tip means nothing to do, not 'rescan the same window'.
+
+    The bug this guards: re-walking the last window when the cursor already
+    matched the tip. On a scheduled runner that repeats forever, burning API
+    calls and (absent dedup) re-alerting the same events each time.
+    """
+    settings = build_settings(tmp_path, window=3)
+    tip = 900_000
+    chain = FakeChain(
+        tip=tip,
+        blocks={f"hash-{h}": ["tx-old"] for h in range(tip - 2, tip + 1)},
+        txs={"tx-old": make_old_spend_tx("tx-old", 100, 1_000_000_000)},
+    )
+    store = Store(settings.db_path)
+    try:
+        store.set_state("last_scanned_height", tip)
+        result = scan_once(settings, client=chain, store=store)
+        assert result.blocks_examined == 0, "must not rescan blocks already processed"
+        assert result.transactions_examined == 0
+        assert result.wakeups == []
+    finally:
+        store.close()
+
+
+def test_cursor_ahead_of_tip_is_also_a_no_op(tmp_path):
+    """A reorg or a stale cursor must not cause a backward rescan either."""
+    settings = build_settings(tmp_path, window=3)
+    tip = 900_000
+    chain = FakeChain(tip=tip, blocks={f"hash-{h}": [] for h in range(tip, tip + 4)}, txs={})
+    store = Store(settings.db_path)
+    try:
+        store.set_state("last_scanned_height", tip + 5)
+        result = scan_once(settings, client=chain, store=store)
+        assert result.blocks_examined == 0
+    finally:
+        store.close()
+
+
+def test_first_run_still_walks_the_window_backward(tmp_path):
+    """With no cursor at all, the initial window must still be scanned."""
+    settings = build_settings(tmp_path, window=3)
+    tip = 900_000
+    chain = FakeChain(tip=tip, blocks={f"hash-{h}": [] for h in range(tip - 2, tip + 1)}, txs={})
+    store = Store(settings.db_path)
+    try:
+        result = scan_once(settings, client=chain, store=store)
+        assert result.blocks_examined == 3
+        assert result.scanned_from == tip - 2
+    finally:
+        store.close()
+
+
 def test_scan_resumes_from_cursor(tmp_path):
     settings = build_settings(tmp_path)
     store = Store(settings.db_path)

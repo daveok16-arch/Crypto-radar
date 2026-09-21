@@ -173,7 +173,14 @@ class Store:
         ).fetchone()
         return row is not None
 
-    def mark_alerted(self, outpoint: str) -> None:
+    def mark_alerted(self, outpoint: str, commit: bool = True) -> None:
+        """Record an outpoint as alerted.
+
+        `commit=False` defers the write, so a batch of marks costs one commit
+        instead of one per call. A commit per mark is correct but quadratically
+        slow at scale (thousands of events took ~12s), and this runs inside a
+        scheduled job with a hard timeout.
+        """
         import time
 
         self._conn.execute(
@@ -181,6 +188,11 @@ class Store:
             "VALUES (?, ?)",
             (outpoint, time.time()),
         )
+        if commit:
+            self._conn.commit()
+
+    def commit(self) -> None:
+        """Flush any deferred writes."""
         self._conn.commit()
 
     def alerted_count(self) -> int:

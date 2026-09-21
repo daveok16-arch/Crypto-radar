@@ -39,6 +39,7 @@ from typing import Optional
 
 from .alerting import Alert, AlertPolicy, evaluate
 from .notify import Channel, format_digest
+from .state import StateBackend
 from .store import Store
 
 logger = logging.getLogger(__name__)
@@ -75,6 +76,7 @@ class Notifier:
         digest_mode: bool = False,
         digest_interval_seconds: float = 3600.0,
         digest_max_items: int = 25,
+        state: "StateBackend | None" = None,
     ):
         self.store = store
         self.policy = policy
@@ -83,6 +85,67 @@ class Notifier:
         self.digest_mode = digest_mode
         self.digest_interval_seconds = digest_interval_seconds
         self.digest_max_items = digest_max_items
+        # Portable dedup state. On a stateless cloud run the SQLite store is
+        # empty every time, so without this the same alert is re-sent on every
+        # run — the failure this whole mechanism exists to prevent.
+        self.state = state
+        self._radar_state = state.load() if state is not None else None
+        self._alerted_this_run: set[str] = set()
+
+    def _already_alerted(self, outpoint: str) -> bool:
+        if outpoint in self._alerted_this_run:
+            return True
+        if self._radar_state is not None:
+            return outpoint in set(self._radar_state.alerted_outpoints)
+        return self.store.was_alerted(outpoint)
+
+    def _mark_alerted(self, outpoint: str, commit: bool = True) -> None:
+        """Record an outpoint as alerted, in memory and in the store.
+
+        `commit=False` lets callers batching many marks pay a single commit.
+        """
+        self._alerted_this_run.add(outpoint)
+        self.store.mark_alerted(outpoint, commit=commit)
+        if self._radar_state is not None:
+            if outpoint not in self._radar_state.alerted_outpoints:
+                self._radar_state.alerted_outpoints.append(outpoint)
+            # Bound the list so a long-running deployment cannot grow it without
+            # limit. Dropping the oldest risks a very old event re-alerting,
+            # which is far preferable to unbounded growth.
+            if len(self._radar_state.alerted_outpoints) > 5000:
+                self._radar_state.alerted_outpoints = (
+                    self._radar_state.alerted_outpoints[-5000:]
+                )
+
+    def _mark_many_alerted(self, outpoints: list[str]) -> None:
+        """Mark a batch with one commit rather than one per outpoint."""
+        for outpoint in outpoints:
+            self._mark_alerted(outpoint, commit=False)
+        self.store.commit()
+
+    def flush_state(self) -> None:
+        """Persist dedup state. Call once at the end of a run."""
+        if self.state is not None and self._radar_state is not None:
+            self.state.save(self._radar_state)
+
+    def install_state(self, state) -> None:
+        """Attach a portable state backend and load the dedup set from it."""
+        self.state = state
+        self._radar_state = state.load() if state is not None else None
+
+    def snapshot_state(self, scanned_to: Optional[int] = None):
+        """Return current durable state for persistence, with the cursor set."""
+        if self._radar_state is None:
+            return None
+        if scanned_to is not None:
+            self._radar_state.last_scanned_height = scanned_to
+        if self.state is not None:
+            self.state.save(self._radar_state)
+        return self._radar_state
+
+    @property
+    def alerted_outpoints(self) -> list[str]:
+        return list(self._radar_state.alerted_outpoints) if self._radar_state else []
 
     def _recent_deliveries(self) -> list[float]:
         raw = self.store.get_state("alert_delivery_times") or []
@@ -106,7 +169,7 @@ class Notifier:
             alert = evaluate(wakeup, self.policy)
             if alert is None:
                 continue
-            if self.store.was_alerted(alert.dedupe_key):
+            if self._already_alerted(alert.dedupe_key):
                 continue
             pending.append(alert)
         return pending
@@ -132,7 +195,7 @@ class Notifier:
             result.matched += 1
 
             key = alert.dedupe_key
-            if self.store.was_alerted(key):
+            if self._already_alerted(key):
                 result.suppressed_duplicates += 1
                 continue
 
@@ -144,7 +207,7 @@ class Notifier:
                 break
 
             if self._deliver(alert, result):
-                self.store.mark_alerted(key)
+                self._mark_alerted(key)
                 delivered_times.append(time.time())
                 result.delivered += 1
                 result.alerts.append(alert)
@@ -210,7 +273,8 @@ class Notifier:
             # Marked only now, after a channel accepted, so a crash between
             # queueing and sending cannot lose these alerts.
             for alert in pending:
-                self.store.mark_alerted(alert.dedupe_key)
+                self._mark_alerted(alert.dedupe_key)
+            self.store.commit()
             self.store.set_state("last_digest_at", now)
             result.digest_sent = True
             result.delivered = len(pending)

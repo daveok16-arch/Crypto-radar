@@ -76,7 +76,21 @@ def scan_once(
     result.tip_height = tip
 
     last_scanned = store.get_state("last_scanned_height")
-    if isinstance(last_scanned, int) and last_scanned < tip:
+    if isinstance(last_scanned, int):
+        if last_scanned >= tip:
+            # Cursor is at or ahead of the tip: nothing new to do. Rescanning
+            # the same window here would repeat work every run — on a schedule
+            # that means re-scanning the same blocks forever, and (before dedup)
+            # re-alerting them. The window is only walked backward on a first
+            # run, when there is no cursor at all.
+            logger.info(
+                "no new blocks since height %d (tip %d); nothing to scan",
+                last_scanned,
+                tip,
+            )
+            result.scanned_from = result.scanned_to = tip
+            result.graph = graph
+            return result
         start = last_scanned + 1
     else:
         start = tip - settings.scan_window_blocks + 1

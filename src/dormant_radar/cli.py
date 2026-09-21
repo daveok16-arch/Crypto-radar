@@ -348,6 +348,75 @@ def _cmd_backfill(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_cloud_run(args: argparse.Namespace) -> int:
+    """One stateless run: scan recent blocks, alert on matches, persist state.
+
+    Designed for a scheduled cloud runner where the filesystem is not durable.
+    Dedup state is loaded from and saved to the portable backend (the
+    automation KV store when configured), because an empty SQLite file every
+    run would re-alert the same events indefinitely.
+    """
+    from .notifier import Notifier
+    from .notify import build_channels
+    from .redact import install_redaction, register_many
+    from .scanner import scan_once
+    from .state import open_state
+    from .store import Store
+
+    install_redaction()
+    settings = Settings.from_env()
+    register_many(
+        [
+            settings.telegram_bot_token,
+            settings.smtp_password,
+            *settings.telegram_chat_ids,
+        ]
+    )
+
+    # Local databases are scratch space on a cloud pod; the durable state
+    # travels through the backend instead.
+    state = open_state(local_path=args.state_path)
+    store = Store(settings.db_path)
+    try:
+        loaded = state.load()
+        if loaded.last_scanned_height is not None:
+            # Seed the cursor so this run resumes rather than rescanning.
+            store.set_state("last_scanned_height", loaded.last_scanned_height)
+
+        scan_result = scan_once(settings, store=store)
+
+        channels = build_channels(settings)
+        notifier = settings.build_notifier(store, channels)
+        notifier.install_state(state)
+        run = notifier.run()
+
+        # Persist the cursor and the dedup set, so the next run neither
+        # rescans nor re-alerts.
+        notifier.snapshot_state(scanned_to=scan_result.scanned_to)
+
+        print(
+            json.dumps(
+                {
+                    "blocks": [scan_result.scanned_from, scan_result.scanned_to],
+                    "transactions_examined": scan_result.transactions_examined,
+                    "wakeups_found": len(scan_result.wakeups),
+                    "new_wakeups": scan_result.new_wakeups,
+                    "alerts_matched": run.matched,
+                    "alerts_delivered": run.delivered,
+                    "duplicates_suppressed": run.suppressed_duplicates,
+                    "digest_mode": settings.alert_digest_mode,
+                    "state_backend": state.name,
+                    "tracked_outpoints": len(notifier.alerted_outpoints),
+                    "errors": scan_result.errors[:3],
+                },
+                indent=2,
+            )
+        )
+    finally:
+        store.close()
+    return 0
+
+
 def _cmd_serve(args: argparse.Namespace) -> int:
     import uvicorn
 
@@ -432,6 +501,17 @@ def main(argv: list[str] | None = None) -> int:
         "--dry-run", action="store_true", help="fetch but do not record anything"
     )
     p_backfill.set_defaults(func=_cmd_backfill)
+
+    p_cloud = sub.add_parser(
+        "cloud-run",
+        help="one stateless run for a scheduled cloud runner",
+    )
+    p_cloud.add_argument(
+        "--state-path",
+        default=None,
+        help="local state file when no KV store is configured",
+    )
+    p_cloud.set_defaults(func=_cmd_cloud_run)
 
     args = parser.parse_args(argv)
     return args.func(args)

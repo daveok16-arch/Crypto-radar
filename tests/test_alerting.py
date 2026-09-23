@@ -140,3 +140,61 @@ def test_single_trigger_property():
     assert not AlertPolicy(
         min_value_sats=1, min_dormant_years=1.0
     ).single_trigger
+
+
+# --- configuration wiring ----------------------------------------------
+#
+# These exist because alerting was silently dead in every deployed
+# configuration: `from_env()` passed None for each unset threshold, which
+# disabled every trigger. A wake-up was detected and then matched nothing.
+
+
+def test_from_env_keeps_default_thresholds_when_unset(monkeypatch):
+    """Unset must mean 'use the default', not 'disable the trigger'."""
+    from dormant_radar.config import Settings
+
+    for var in (
+        "ALERT_MIN_VALUE_SATS",
+        "ALERT_MIN_DORMANT_YEARS",
+        "ALERT_MIN_ANOMALY_SCORE",
+        "ALERT_MIN_CLUSTER_SIZE",
+    ):
+        monkeypatch.delenv(var, raising=False)
+
+    policy = Settings.from_env().alert_policy()
+    assert policy.min_value_sats == 5_000_000_000
+    assert policy.min_dormant_years == 8.0
+    # These two are genuinely opt-in, so staying off is correct.
+    assert policy.min_anomaly_score is None
+    assert policy.min_cluster_size is None
+
+
+def test_from_env_policy_can_actually_fire(monkeypatch):
+    """The check that matters: a real wake-up trips the default policy."""
+    from dormant_radar.config import Settings
+
+    monkeypatch.delenv("ALERT_MIN_VALUE_SATS", raising=False)
+    monkeypatch.delenv("ALERT_MIN_DORMANT_YEARS", raising=False)
+    policy = Settings.from_env().alert_policy()
+
+    wakeup = make_wakeup(value_sats=8_000_000_000, years=3.6)
+    assert evaluate(wakeup, policy) is not None, "a default-config policy must be armed"
+
+
+def test_from_env_respects_explicit_threshold(monkeypatch):
+    from dormant_radar.config import Settings
+
+    monkeypatch.setenv("ALERT_MIN_VALUE_SATS", "123")
+    monkeypatch.setenv("ALERT_MIN_DORMANT_YEARS", "1.5")
+    policy = Settings.from_env().alert_policy()
+    assert policy.min_value_sats == 123
+    assert policy.min_dormant_years == 1.5
+
+
+def test_threshold_can_be_explicitly_disabled(monkeypatch):
+    """Disabling a trigger must stay expressible, just not the default."""
+    from dormant_radar.config import Settings
+
+    monkeypatch.setenv("ALERT_MIN_VALUE_SATS", "none")
+    policy = Settings.from_env().alert_policy()
+    assert policy.min_value_sats is None

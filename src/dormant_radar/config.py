@@ -22,16 +22,29 @@ def _float(name: str, default: float) -> float:
     return float(raw)
 
 
-def _optional_int(name: str) -> int | None:
+def _optional_int(name: str, default: int | None = None) -> int | None:
+    """Read an optional int from the environment.
+
+    An absent or blank variable yields `default`, NOT None. Conflating those was
+    a real bug: `from_env()` passed None for every unset alert threshold, which
+    silently disabled alerting entirely — a wake-up would be detected and then
+    match nothing. "Unset" must mean "use the default"; disabling a trigger is
+    expressed explicitly (see `_disabled_int` below).
+    """
     raw = os.environ.get(name)
     if raw is None or raw.strip() == "":
+        return default
+    if raw.strip().lower() in ("none", "off", "disabled", ""):
         return None
     return int(raw)
 
 
-def _optional_float(name: str) -> float | None:
+def _optional_float(name: str, default: float | None = None) -> float | None:
+    """Read an optional float from the environment; absent yields `default`."""
     raw = os.environ.get(name)
     if raw is None or raw.strip() == "":
+        return default
+    if raw.strip().lower() in ("none", "off", "disabled"):
         return None
     return float(raw)
 
@@ -127,10 +140,13 @@ class Settings:
             backfill_max_addresses_per_run=_int("BACKFILL_MAX_ADDRESSES_PER_RUN", 10),
             backfill_max_pages_per_run=_int("BACKFILL_MAX_PAGES_PER_RUN", 20),
             alerts_enabled=_bool("ALERTS_ENABLED", False),
-            alert_min_value_sats=_optional_int("ALERT_MIN_VALUE_SATS"),
-            alert_min_dormant_years=_optional_float("ALERT_MIN_DORMANT_YEARS"),
-            alert_min_anomaly_score=_optional_float("ALERT_MIN_ANOMALY_SCORE"),
-            alert_min_cluster_size=_optional_int("ALERT_MIN_CLUSTER_SIZE"),
+            # Defaults are passed explicitly so an unset variable means "use the
+            # default" rather than "disable this trigger". Passing nothing here
+            # was a bug that made alerting silently match nothing.
+            alert_min_value_sats=_optional_int("ALERT_MIN_VALUE_SATS", 5_000_000_000),
+            alert_min_dormant_years=_optional_float("ALERT_MIN_DORMANT_YEARS", 8.0),
+            alert_min_anomaly_score=_optional_float("ALERT_MIN_ANOMALY_SCORE", None),
+            alert_min_cluster_size=_optional_int("ALERT_MIN_CLUSTER_SIZE", None),
             alert_on_self_transfer=_bool("ALERT_ON_SELF_TRANSFER", False),
             alert_max_per_hour=_int("ALERT_MAX_PER_HOUR", 20),
             alert_digest_mode=_bool("ALERT_DIGEST_MODE", False),
